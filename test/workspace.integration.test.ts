@@ -16,19 +16,22 @@ integration("live workspace updates", () => {
     try {
       await fs.mkdir(build, { recursive: true });
       await fs.writeFile(source, "int before_edit() { return 1; }\n");
+      const useWsl = process.platform === "win32";
+      const compilerSource = useWsl ? windowsToWsl(source) : source;
+      const compilerBuild = useWsl ? windowsToWsl(build) : build;
       await fs.writeFile(path.join(build, "compile_commands.json"), JSON.stringify([{
-        command: `clang++ -std=c++23 -c ${windowsToWsl(source)}`,
-        directory: windowsToWsl(build),
-        file: windowsToWsl(source),
-        output: `${windowsToWsl(build)}/main.cpp.o`,
+        command: `clang++ -std=c++23 -c ${compilerSource}`,
+        directory: compilerBuild,
+        file: compilerSource,
+        output: `${compilerBuild}/main.cpp.o`,
       }]));
       await workspace.open({
         buildDirectory: build,
         experimentalModules: false,
         mode: "cpp",
         root,
-        transport: "wsl",
-        wslDistro: "Arch",
+        transport: useWsl ? "wsl" : "native",
+        wslDistro: useWsl ? "Arch" : undefined,
       });
       expect(JSON.stringify(await workspace.documentSymbols(source))).toContain("before_edit");
 
@@ -45,9 +48,12 @@ integration("live workspace updates", () => {
       expect(applied.applied).toBe(true);
       expect(await fs.readFile(source, "utf8")).toContain("int after_edit() { return 2; }");
 
-      const refreshed = await workspace.refresh("integration test");
+      const refresh = workspace.refresh("integration test");
+      const symbolsDuringRefresh = workspace.documentSymbols(source);
+      const [refreshed, refreshedSymbols] = await Promise.all([refresh, symbolsDuringRefresh]);
       expect(refreshed.compileDatabase?.diskWrites).toBe(0);
       expect(refreshed.state).toBe("ready");
+      expect(JSON.stringify(refreshedSymbols)).toContain("after_edit");
     } finally {
       await workspace.close();
       await fs.rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });

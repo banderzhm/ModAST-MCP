@@ -41,13 +41,17 @@ export interface ModuleUnit {
   line: number;
   name: string;
   path: string;
-  qualityWarnings?: ModuleQualityWarning[];
 }
 
 export interface ModuleQualityWarning {
+  bodyLines: number;
+  code: "business-logic-in-interface" | "missing-implementation-unit";
+  controlFlowCount: number;
+  hasImplementationUnit: boolean;
   line: number;
   message: string;
   severity: "warning";
+  statementCount: number;
   symbol?: string;
 }
 

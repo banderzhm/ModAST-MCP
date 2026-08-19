@@ -117,10 +117,21 @@ export function createServer(workspace = new Workspace()): McpServer {
   }, async ({ name, transitive }) => result(workspace.moduleGraph(name, transitive)));
 
   server.registerTool("module_quality", {
-    description: "Warn when a module interface contains long function bodies that should move to a .cpp implementation unit.",
-    inputSchema: { file: z.string().optional() },
-  }, async ({ file }) => {
-    try { return result(workspace.moduleQuality(file)); } catch (error) { return errorResult(error); }
+    description: "Use clangd AST to find non-trivial definitions in module interfaces and verify matching .cpp implementation units.",
+    inputSchema: {
+      concurrency: z.number().int().min(1).max(8).default(4),
+      file: z.string().optional(),
+      minBodyLines: z.number().int().min(3).max(100).default(6),
+      minStatements: z.number().int().min(2).max(100).default(5),
+    },
+  }, async ({ file, minBodyLines, minStatements, concurrency }, extra) => {
+    try {
+      return result(await withHeartbeat(
+        workspace.moduleQuality(file, minBodyLines, minStatements, concurrency),
+        extra,
+        file ? `Module quality ${file}` : "Module quality workspace scan",
+      ));
+    } catch (error) { return errorResult(error); }
   });
 
   server.registerTool("format", {

@@ -1,6 +1,6 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import type { ModuleImport, ModuleQualityWarning, ModuleUnit, ModuleUnitKind } from "./types.js";
+import type { ModuleImport, ModuleUnit, ModuleUnitKind } from "./types.js";
 
 const SOURCE_EXTENSIONS = new Set([".cc", ".cpp", ".cxx", ".cppm", ".ixx", ".mpp"]);
 const IGNORED_DIRECTORIES = new Set([
@@ -9,7 +9,6 @@ const IGNORED_DIRECTORIES = new Set([
 
 interface ParsedSource {
   imports: ModuleImport[];
-  qualityWarnings?: ModuleQualityWarning[];
   unit?: Omit<ModuleUnit, "path" | "imports">;
 }
 
@@ -46,7 +45,6 @@ export function parseModuleSource(source: string): ParsedSource {
       : (exported ? "interface" : "implementation");
     return {
       imports,
-      qualityWarnings: [],
       unit: {
         kind,
         line: clean.slice(0, declaration.index).split(/\r?\n/).length,
@@ -54,35 +52,7 @@ export function parseModuleSource(source: string): ParsedSource {
       },
     };
   }
-  return { imports, qualityWarnings: [] };
-}
-
-function qualityWarnings(source: string, unit: Omit<ModuleUnit, "path" | "imports">): ModuleQualityWarning[] {
-  if (unit.kind !== "interface" && unit.kind !== "partition-interface") return [];
-  const lines = source.split(/\r?\n/);
-  const warnings: ModuleQualityWarning[] = [];
-  const functionStart = /^\s*(?:(?:export|inline|static|constexpr|consteval|constinit)\s+)*(?:[\w:<>~,.*&]+\s+)+([~\w]+)\s*\([^;{}]*\)\s*(?:const\s*)?(?:noexcept\s*)?\{/;
-  for (let index = 0; index < lines.length; index += 1) {
-    const match = functionStart.exec(lines[index]);
-    if (!match || /\b(if|for|while|switch|catch)\s*\(/.test(lines[index])) continue;
-    let depth = (lines[index].match(/{/g)?.length ?? 0) - (lines[index].match(/}/g)?.length ?? 0);
-    let end = index;
-    while (depth > 0 && end + 1 < lines.length) {
-      end += 1;
-      depth += (lines[end].match(/{/g)?.length ?? 0) - (lines[end].match(/}/g)?.length ?? 0);
-    }
-    const bodyLines = end - index + 1;
-    if (bodyLines >= 9 && match[1] !== "main") {
-      warnings.push({
-        line: index + 1,
-        message: `Module interface contains a ${bodyLines}-line function body (${match[1]}). Move business logic to a .cpp implementation unit and keep .cppm focused on declarations/exported API.`,
-        severity: "warning",
-        symbol: match[1],
-      });
-    }
-    index = end;
-  }
-  return warnings;
+  return { imports };
 }
 
 async function walk(directory: string, buildDirectory: string, output: string[]): Promise<void> {
@@ -128,10 +98,9 @@ export class ModuleIndex {
           throw error;
         }
         const parsed = parseModuleSource(source);
-        if (parsed.unit) parsed.qualityWarnings = qualityWarnings(source, parsed.unit);
         if (parsed.imports.length > 0) index.importsByFile.set(path.resolve(file), parsed.imports);
         if (parsed.unit) {
-          const unit: ModuleUnit = { ...parsed.unit, imports: parsed.imports, path: path.resolve(file), qualityWarnings: parsed.qualityWarnings ?? [] };
+          const unit: ModuleUnit = { ...parsed.unit, imports: parsed.imports, path: path.resolve(file) };
           index.units.push(unit);
           const group = index.unitsByName.get(unit.name) ?? [];
           group.push(unit);
@@ -157,8 +126,7 @@ export class ModuleIndex {
     const parsed = parseModuleSource(source);
     if (parsed.imports.length > 0) this.importsByFile.set(absolute, parsed.imports);
     if (!parsed.unit) return previous;
-    parsed.qualityWarnings = qualityWarnings(source, parsed.unit);
-    const unit: ModuleUnit = { ...parsed.unit, imports: parsed.imports, path: absolute, qualityWarnings: parsed.qualityWarnings };
+    const unit: ModuleUnit = { ...parsed.unit, imports: parsed.imports, path: absolute };
     this.units.push(unit);
     this.units.sort((left, right) => left.name.localeCompare(right.name) || left.path.localeCompare(right.path));
     const group = this.unitsByName.get(unit.name) ?? [];

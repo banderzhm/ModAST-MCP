@@ -3,12 +3,15 @@ import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { watch, type FSWatcher } from "chokidar";
+import { pruneWorkspaceCaches, type CacheCleanupResult } from "./cache.js";
 import { prepareCompileDatabase, type CompileDatabaseInfo } from "./compile-database.js";
 import { LspClient } from "./lsp-client.js";
 import { ModuleIndex } from "./module-index.js";
-import type { ModuleQualityWarning, Position, Range, WorkspaceOptions, WorkspaceState } from "./types.js";
+import { analyzeModuleInterfaceAst } from "./module-quality.js";
+import type { AstNode, ModuleUnit, Position, Range, WorkspaceOptions, WorkspaceState } from "./types.js";
 import { fileUri, normalizeFsPath, uriToDisplayPath, wslToWindows } from "./util/paths.js";
 import { positionOf } from "./util/text.js";
+import { replaceFileIfUnchanged } from "./util/safe-write.js";
 
 function applyTextEdits(source: string, edits: Array<{ newText: string; range: Range }>): string {
   const lineOffsets: number[] = [0];
@@ -30,9 +33,18 @@ interface DiagnosticState {
   version?: number;
 }
 
-async function detectWorkspaceMode(buildDirectory: string): Promise<"cpp" | "modules"> {
-  const commands = JSON.parse(await fs.readFile(path.join(buildDirectory, "compile_commands.json"), "utf8")) as Array<{ file: string }>;
-  return commands.some((command) => [".cppm", ".ixx", ".mpp"].includes(path.extname(command.file).toLowerCase()))
+export async function detectWorkspaceMode(buildDirectory: string): Promise<"cpp" | "modules"> {
+  const commands = JSON.parse(await fs.readFile(path.join(buildDirectory, "compile_commands.json"), "utf8")) as Array<{
+    arguments?: string[];
+    command?: string;
+    file: string;
+  }>;
+  const moduleFlag = /(?:^|\s)(?:-x\s*c\+\+-module|-fmodule-output(?:=|\s)|-emit-module-interface|\/interface(?:\s|$)|\/ifcOutput(?:\s|$))/i;
+  return commands.some((command) => {
+    if ([".cppm", ".ixx", ".mpp"].includes(path.extname(command.file).toLowerCase())) return true;
+    const invocation = command.arguments?.join(" ") ?? command.command ?? "";
+    return moduleFlag.test(invocation);
+  })
     ? "modules"
     : "cpp";
 }
@@ -62,6 +74,7 @@ export interface WorkspaceStatus {
   staleModules: string[];
   lastChangeAt?: string;
   refreshes: number;
+  cacheCleanup?: CacheCleanupResult;
 }
 
 export class Workspace {
@@ -89,6 +102,9 @@ export class Workspace {
   private sourceChanges = 0;
   private lastChangeAt?: string;
   private refreshes = 0;
+  private cacheCleanup?: CacheCleanupResult;
+  private closePromise?: Promise<void>;
+  private closing = false;
   private state: WorkspaceState = "closed";
   private warmCompleted = 0;
   private warmTotal = 0;
@@ -99,6 +115,7 @@ export class Workspace {
     progress?: (phase: string, completed: number, total: number, message: string) => void,
   ): Promise<WorkspaceStatus> {
     await this.close();
+    this.closing = false;
     this.state = "starting";
     this.startedAt = Date.now();
     this.message = undefined;
@@ -110,7 +127,9 @@ export class Workspace {
       const effectiveMode = options.mode === "auto" ? await detectWorkspaceMode(buildDirectory) : options.mode;
       this.options = { ...options, buildDirectory, mode: effectiveMode, root };
       const workspaceKey = createHash("sha256").update(`${root}\0${buildDirectory}`).digest("hex").slice(0, 16);
-      const cacheDirectory = path.join(os.tmpdir(), "modast-mcp", workspaceKey, "compile-db");
+      const cacheRoot = path.join(os.tmpdir(), "modast-mcp");
+      this.cacheCleanup = await pruneWorkspaceCaches(cacheRoot, workspaceKey);
+      const cacheDirectory = path.join(cacheRoot, workspaceKey, "compile-db");
       this.cacheDirectory = cacheDirectory;
       this.report("load-cdb", 0, 1, "Loading compile_commands.json", progress);
       const prepared = await prepareCompileDatabase(buildDirectory, cacheDirectory,
@@ -130,19 +149,32 @@ export class Workspace {
       this.report("ready", 1, 1, "Workspace is ready", progress);
       return this.status();
     } catch (error) {
+      await this.watcher?.close().catch(() => undefined);
+      this.watcher = undefined;
+      await this.client?.stop().catch(() => undefined);
+      this.client = undefined;
       this.state = "error";
       this.message = error instanceof Error ? error.message : String(error);
       throw error;
     }
   }
 
-  async close(): Promise<void> {
+  close(): Promise<void> {
+    if (this.closePromise) return this.closePromise;
+    this.closing = true;
+    this.closePromise = this.performClose().finally(() => { this.closePromise = undefined; });
+    return this.closePromise;
+  }
+
+  private async performClose(): Promise<void> {
     if (this.refreshTimer) clearTimeout(this.refreshTimer);
     this.refreshTimer = undefined;
-    await this.watcher?.close();
+    await Promise.allSettled([this.refreshPromise, this.warmPromise].filter(Boolean) as Promise<unknown>[]);
+    const watcher = this.watcher;
+    const client = this.client;
     this.watcher = undefined;
-    await this.client?.stop();
     this.client = undefined;
+    await Promise.allSettled([watcher?.close(), client?.stop()].filter(Boolean) as Promise<unknown>[]);
     this.compileInfo = undefined;
     this.diagnostics.clear();
     this.index = undefined;
@@ -162,6 +194,7 @@ export class Workspace {
     this.sourceChanges = 0;
     this.lastChangeAt = undefined;
     this.refreshes = 0;
+    this.cacheCleanup = undefined;
   }
 
   status(): WorkspaceStatus {
@@ -190,13 +223,21 @@ export class Workspace {
       staleModules: [...this.staleModules].sort(),
       lastChangeAt: this.lastChangeAt,
       refreshes: this.refreshes,
+      cacheCleanup: this.cacheCleanup,
     };
   }
 
   refresh(reason = "manual"): Promise<WorkspaceStatus> {
-    this.requireReady();
+    if (this.closing) return Promise.reject(new Error("Workspace is closing"));
     if (this.refreshPromise) return this.refreshPromise;
-    this.refreshPromise = this.performRefresh(reason).finally(() => { this.refreshPromise = undefined; });
+    this.requireReady();
+    this.refreshPromise = this.performRefresh(reason)
+      .catch((error) => {
+        this.state = "error";
+        this.message = error instanceof Error ? error.message : String(error);
+        throw error;
+      })
+      .finally(() => { this.refreshPromise = undefined; });
     return this.refreshPromise;
   }
 
@@ -248,16 +289,29 @@ export class Workspace {
     };
   }
 
-  moduleQuality(file?: string): unknown {
-    this.requireIndex();
-    if (file) {
-      const absolute = this.resolveFile(file);
-      const unit = this.index!.units.find((candidate) => path.resolve(candidate.path) === absolute);
-      return { file: normalizeFsPath(absolute), warnings: unit?.qualityWarnings ?? [] };
+  async moduleQuality(file?: string, minBodyLines = 6, minStatements = 5, concurrency = 4): Promise<unknown> {
+    await this.waitForRefresh();
+    const interfaces = file
+      ? [this.index!.units.find((candidate) => path.resolve(candidate.path) === this.resolveFile(file))].filter(Boolean) as ModuleUnit[]
+      : this.index!.units.filter((unit) => ["interface", "partition-interface"].includes(unit.kind));
+    if (file && interfaces.length === 0) throw new Error(`Not a module interface unit: ${file}`);
+    const results: unknown[] = [];
+    for (let offset = 0; offset < interfaces.length; offset += concurrency) {
+      const batch = await Promise.all(interfaces.slice(offset, offset + concurrency).map(async (unit) => {
+        try {
+          return await this.analyzeQualityUnit(unit, minBodyLines, minStatements);
+        } catch (error) {
+          return { error: error instanceof Error ? error.message : String(error), file: normalizeFsPath(unit.path), module: unit.name, warnings: [] };
+        }
+      }));
+      results.push(...batch);
     }
-    return this.index!.units
-      .filter((unit) => (unit.qualityWarnings?.length ?? 0) > 0)
-      .map((unit) => ({ file: normalizeFsPath(unit.path), warnings: unit.qualityWarnings ?? [] }));
+    return {
+      checkedInterfaces: interfaces.length,
+      filesWithWarnings: results.filter((item) => ((item as { warnings?: unknown[] }).warnings?.length ?? 0) > 0).length,
+      results,
+      warningCount: results.reduce<number>((sum, item) => sum + ((item as { warnings?: unknown[] }).warnings?.length ?? 0), 0),
+    };
   }
 
   async format(file: string, apply: boolean, tabSize: number, insertSpaces: boolean): Promise<unknown> {
@@ -269,7 +323,7 @@ export class Workspace {
     const original = this.openFiles.get(absolute)!;
     const formatted = edits?.length ? applyTextEdits(original, edits) : original;
     if (apply && formatted !== original) {
-      await fs.writeFile(absolute, formatted);
+      await replaceFileIfUnchanged(absolute, original, formatted);
       await this.applySourceChange(absolute, formatted);
     }
     return {
@@ -307,7 +361,7 @@ export class Workspace {
   }
 
   async workspaceSymbols(query: string): Promise<unknown> {
-    this.requireReady();
+    await this.waitForRefresh();
     const symbols = await this.request("workspace/symbol", { query });
     return {
       clangd: this.remap(symbols),
@@ -343,6 +397,7 @@ export class Workspace {
   }
 
   async locate(file: string, line?: number, character?: number, needle?: string, occurrence = 1): Promise<Position> {
+    await this.waitForRefresh();
     const absolute = this.resolveFile(file);
     const source = await fs.readFile(absolute, "utf8");
     if (needle !== undefined) return positionOf(source, needle, occurrence);
@@ -354,7 +409,7 @@ export class Workspace {
   }
 
   private async openDocument(absolute: string): Promise<string> {
-    this.requireReady();
+    await this.waitForRefresh();
     const text = await fs.readFile(absolute, "utf8");
     if (this.openFiles.has(absolute)) {
       if (this.openFiles.get(absolute) !== text) {
@@ -377,6 +432,45 @@ export class Workspace {
       .filter((unit) => unit.kind === "interface" || unit.kind === "partition-interface")
       .map((unit) => unit.path);
     return interfaces.slice(0, Math.max(0, limit));
+  }
+
+  private async analyzeQualityUnit(unit: ModuleUnit, minBodyLines: number, minStatements: number): Promise<unknown> {
+    const absolute = path.resolve(unit.path);
+    const alreadyOpen = this.openFiles.has(absolute);
+    await this.openDocument(absolute);
+    try {
+      const source = this.openFiles.get(absolute)!;
+      const ast = await this.request("textDocument/ast", {
+        range: {
+          start: { line: 0, character: 0 },
+          end: { line: Math.max(0, source.split(/\r?\n/).length - 1), character: 100_000 },
+        },
+        textDocument: { uri: this.uri(absolute) },
+      }) as AstNode | null;
+      const hasImplementationUnit = (this.index!.unitsByName.get(unit.name) ?? []).some((candidate) =>
+        ["implementation", "partition-implementation"].includes(candidate.kind)
+        && [".cc", ".cpp", ".cxx"].includes(path.extname(candidate.path).toLowerCase()));
+      return {
+        file: normalizeFsPath(absolute),
+        hasImplementationUnit,
+        module: unit.name,
+        warnings: analyzeModuleInterfaceAst(ast, {
+          hasImplementationUnit,
+          minBodyLines,
+          minStatements,
+          moduleName: unit.name,
+        }),
+      };
+    } finally {
+      if (!alreadyOpen) this.closeDocument(absolute);
+    }
+  }
+
+  private closeDocument(file: string): void {
+    if (!this.openFiles.has(file) || !this.client) return;
+    this.client.notify("textDocument/didClose", { textDocument: { uri: this.uri(file) } });
+    this.openFiles.delete(file);
+    this.documentVersions.delete(file);
   }
 
   private async startWatcher(sourceFiles: string[], artifactFiles: string[]): Promise<void> {
@@ -429,6 +523,7 @@ export class Workspace {
   }
 
   private scheduleRefresh(reason: string): void {
+    if (this.closing) return;
     if (this.refreshTimer) clearTimeout(this.refreshTimer);
     this.recordEvent(`Refresh scheduled: ${reason}`);
     this.refreshTimer = setTimeout(() => {
@@ -553,7 +648,8 @@ export class Workspace {
   }
 
   private resolveFile(file: string): string {
-    this.requireReady();
+    this.requireIndex();
+    if (!this.options) throw new Error("Workspace is not open");
     const mapped = file.startsWith("/mnt/") ? wslToWindows(file) : file;
     const absolute = path.isAbsolute(mapped) ? path.resolve(mapped) : path.resolve(this.options!.root, mapped);
     const relative = path.relative(this.options!.root, absolute);
@@ -566,8 +662,7 @@ export class Workspace {
   }
 
   private request(method: string, params: unknown): Promise<unknown> {
-    this.requireReady();
-    return this.client!.request(method, params);
+    return this.waitForRefresh().then(() => this.client!.request(method, params));
   }
 
   private remap(value: unknown): unknown {
@@ -583,9 +678,15 @@ export class Workspace {
   }
 
   private requireReady(): void {
-    if (!this.client || !this.options || !this.index || !["ready", "warming", "refreshing"].includes(this.state)) {
+    if (!this.client || !this.options || !this.index || !["ready", "warming"].includes(this.state)) {
       throw new Error(`Workspace is not ready (state: ${this.state})`);
     }
+  }
+
+  private async waitForRefresh(): Promise<void> {
+    const refresh = this.refreshPromise;
+    if (refresh) await refresh;
+    this.requireReady();
   }
 
   private requireIndex(): void {

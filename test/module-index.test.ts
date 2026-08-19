@@ -32,17 +32,6 @@ describe("module index", () => {
     try {
       await fs.writeFile(path.join(root, "address.cppm"), "export module demo.address;\nexport class address {};\n");
       await fs.writeFile(path.join(root, "main.cpp"), "import demo.address;\nint main() {}\n");
-      await fs.writeFile(path.join(root, "business.cppm"), `export module demo.business;
-export int process_order() {
-  int total = 0;
-  total += 1;
-  total += 2;
-  total += 3;
-  total += 4;
-  total += 5;
-  return total;
-}
-`);
       const index = await ModuleIndex.create(root, path.join(root, "build"));
       expect(index.unitsByName.has("demo.address")).toBe(true);
       expect(index.search("demo.address")).toHaveLength(1);
@@ -50,11 +39,6 @@ export int process_order() {
       index.updateFile(path.join(root, "main.cpp"), "import demo.other;\nint main() {}\n");
       expect(index.importers("demo.address")).toEqual([]);
       expect(index.importers("demo.other")).toEqual([path.join(root, "main.cpp")]);
-      expect(index.unitsByName.get("demo.business")?.[0].qualityWarnings?.[0]).toMatchObject({
-        line: 2,
-        severity: "warning",
-        symbol: "process_order",
-      });
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }
